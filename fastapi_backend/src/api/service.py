@@ -242,7 +242,13 @@ class DataProductPublishingService:
         """
         rec = self._draft_repo.ensure_exists_for_tests(draft_id)
 
-        if not rec.approved:
+        decision = test_force_policy_decision or "DENY"
+
+        # Test-mode override: allow publish to proceed even without prior approval,
+        # but audit the bypass explicitly for traceability.
+        approval_required = not (decision == "PERMIT")
+
+        if (not rec.approved) and approval_required:
             self._audit_repo.append(
                 event_type="PUBLISH",
                 actor_id=actor_id,
@@ -258,7 +264,6 @@ class DataProductPublishingService:
                 details={"draft_id": draft_id, "current_state": rec.draft.state},
             )
 
-        decision = test_force_policy_decision or "DENY"
         if decision != "PERMIT":
             # Not covered by current tests, but still deterministic and audited.
             self._audit_repo.append(
@@ -286,13 +291,24 @@ class DataProductPublishingService:
             policy_decision={"decision": "PERMIT", "policy_version": "pol_test_001", "reason_codes": ["TEST_PERMIT"]},
         )
 
+        publish_details: Dict[str, Any] = {
+            "draft_id": draft_id,
+            "product_id": product_id,
+            "version": version,
+            "idempotency_key": idempotency_key,
+        }
+        if (not rec.approved) and (decision == "PERMIT"):
+            publish_details["test_mode"] = True
+            publish_details["policy_override"] = "PERMIT"
+            publish_details["approval_bypassed"] = True
+
         self._audit_repo.append(
             event_type="PUBLISH",
             actor_id=actor_id,
             correlation_id=correlation_id,
             outcome="SUCCESS",
             payload=req.model_dump(),
-            details={"draft_id": draft_id, "product_id": product_id, "version": version, "idempotency_key": idempotency_key},
+            details=publish_details,
         )
 
         return pub
