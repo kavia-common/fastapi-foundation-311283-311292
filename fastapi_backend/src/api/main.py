@@ -17,6 +17,10 @@ Key behaviors:
 - Explicit gate-failure 422 responses with stable error_code (e.g., VAL_FRESHNESS_CHECK_FAILED)
 - Audit logs must be created for both success and failure outcomes.
 - Tests inject an in-memory audit repo via `app.state.audit_log_repo`.
+
+Important note for this task:
+- POST /drafts must enforce Unsupported Media Type (415) *before* any JSON/Pydantic parsing.
+- Error/exception handlers must never include raw bytes in JSON responses (avoid TypeError).
 """
 
 import uuid
@@ -26,6 +30,7 @@ from fastapi import Body, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api.models import (
     ApprovalDecision,
@@ -111,6 +116,22 @@ def _event_type_for_request(request: Request) -> str:
     return "UNKNOWN_EVENT"
 
 
+def _json_safe(obj: Any) -> Any:
+    """
+    Convert potentially non-JSON-serializable values into safe representations.
+
+    This is used defensively in exception handlers because FastAPI's validation errors
+    can embed raw bytes (e.g., input=b'not json'), which would otherwise crash JSONResponse.
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 app = FastAPI(
     title="Data Product Publishing API",
     description="FastAPI implementation of the Data Product Publishing workflow (TDD subset).",
@@ -150,10 +171,11 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
     Convert FastAPI/Pydantic validation errors into standardized error bodies and audit them.
 
     Important behavior for this TDD suite:
-    - We do NOT want draft submission (`POST /drafts`) to surface as 400 due to body parsing;
-      it must either succeed (201), fail semantic metadata validation (422), or be rejected
-      as unsupported media type (415).
-    - For other endpoints, malformed/mismatched request bodies should be 422, not 400.
+    - POST /drafts: Content-Type enforcement is handled in-route (415 before parsing).
+      If we still receive RequestValidationError for /drafts, JSON was supplied but model
+      validation failed -> standardized 400.
+    - Other endpoints: malformed/mismatched request bodies should be 422 (standardized).
+    - Never include raw bytes in response bodies (sanitize exc.errors()).
     """
     correlation_id = _correlation_id_from_request(request)
 
@@ -161,7 +183,8 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
     actor_id = actor_id_from_authorization_header(request.headers.get("Authorization"))
     audit_repo = _get_audit_repo_from_app_state(request.app)
 
-    # /drafts is special-cased: Content-Type enforcement is handled in-route.
+    safe_errors = _json_safe(exc.errors())
+
     if request.url.path == "/drafts" and request.method.upper() == "POST":
         audit_repo.append(
             event_type=event_type,
@@ -169,7 +192,7 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
             correlation_id=correlation_id,
             outcome="FAILURE",
             reason="BAD_REQUEST",
-            payload={"validation_errors": exc.errors()},
+            payload={"validation_errors": safe_errors},
             details={"path": str(request.url.path), "method": request.method},
         )
         return _standard_error(
@@ -178,7 +201,7 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
             correlation_id=correlation_id,
             http_status=400,
             retryable=False,
-            details={"validation_errors": exc.errors()},
+            details={"validation_errors": safe_errors},
         )
 
     audit_repo.append(
@@ -187,7 +210,7 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
         correlation_id=correlation_id,
         outcome="FAILURE",
         reason="REQUEST_VALIDATION_FAILED",
-        payload={"validation_errors": exc.errors()},
+        payload={"validation_errors": safe_errors},
         details={"path": str(request.url.path), "method": request.method},
     )
 
@@ -197,7 +220,42 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
         correlation_id=correlation_id,
         http_status=422,
         retryable=False,
-        details={"validation_errors": exc.errors()},
+        details={"validation_errors": safe_errors},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _handle_starlette_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """
+    Convert Starlette HTTP exceptions into standardized errors and audit them.
+
+    This primarily covers malformed JSON (Starlette raises 400) when we parse JSON manually.
+    """
+    correlation_id = _correlation_id_from_request(request)
+    event_type = _event_type_for_request(request)
+    actor_id = actor_id_from_authorization_header(request.headers.get("Authorization"))
+    audit_repo = _get_audit_repo_from_app_state(request.app)
+
+    msg = str(exc.detail) if exc.detail else "Request failed."
+    error_code = "BAD_REQUEST" if exc.status_code == 400 else "HTTP_ERROR"
+
+    audit_repo.append(
+        event_type=event_type,
+        actor_id=actor_id,
+        correlation_id=correlation_id,
+        outcome="FAILURE",
+        reason=error_code,
+        payload={"http_status": exc.status_code, "detail": msg},
+        details={"path": str(request.url.path), "method": request.method},
+    )
+
+    return _standard_error(
+        error_code=error_code,
+        message=msg,
+        correlation_id=correlation_id,
+        http_status=exc.status_code,
+        retryable=False,
+        details={"path": str(request.url.path)},
     )
 
 
@@ -224,16 +282,20 @@ def health_check() -> Dict[str, str]:
 )
 async def submit_draft(
     request: Request,
-    submission: DraftSubmissionRequest = Body(...),
+    body: bytes = Body(...),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> JSONResponse:
     """
     Submit a new draft.
 
-    - Accepts JSON bodies (tests use TestClient(json=...)).
+    - Reads request body as raw bytes first to allow Content-Type enforcement *before*
+      any JSON/Pydantic parsing (prevents FastAPI RequestValidationError from triggering
+      on non-JSON bodies).
     - Enforces `Content-Type: application/json` and returns 415 for non-JSON payloads.
       (Tests assert 415 on `text/plain`).
+    - Only after passing Content-Type check do we parse JSON and validate into
+      DraftSubmissionRequest.
     - Performs semantic validation for mandatory metadata; on failure returns
       422 with error_code `METADATA_VALIDATION_FAILED`.
     - Appends an audit event for both success and failure.
@@ -242,18 +304,17 @@ async def submit_draft(
     actor_id = actor_id_from_authorization_header(authorization)
     audit_repo = _get_audit_repo_from_app_state(request.app)
 
-    # Enforce content type explicitly to avoid FastAPI returning a generic 422/400 first.
+    # Enforce content type explicitly *before* parsing.
     content_type = (request.headers.get("content-type") or "").lower()
     if "application/json" not in content_type:
-        # Keep payload hashing robust: bytes are supported by the test audit hash implementation.
-        raw_body = await request.body()
+        # For audit hashing, tests support bytes in payload hashing.
         audit_repo.append(
             event_type="DRAFT_SUBMITTED",
             actor_id=actor_id,
             correlation_id=correlation_id,
             outcome="FAILURE",
             reason="UNSUPPORTED_MEDIA_TYPE",
-            payload={"raw_body": raw_body},
+            payload={"raw_body": body},
             details={"path": str(request.url.path), "content_type": content_type},
         )
         return _standard_error(
@@ -264,6 +325,10 @@ async def submit_draft(
             retryable=False,
             details={"content_type": content_type},
         )
+
+    # Now safe to parse JSON. If malformed JSON, Starlette raises 400 which our HTTPException handler standardizes.
+    parsed_json = await request.json()
+    submission = DraftSubmissionRequest.model_validate(parsed_json)
 
     missing = submission.missing_mandatory_metadata_fields()
     if missing:
