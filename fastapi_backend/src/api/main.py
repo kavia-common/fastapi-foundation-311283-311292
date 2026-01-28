@@ -30,6 +30,7 @@ from fastapi import Body, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api.models import (
@@ -282,23 +283,22 @@ def health_check() -> Dict[str, str]:
 )
 async def submit_draft(
     request: Request,
-    body: bytes = Body(...),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> JSONResponse:
     """
     Submit a new draft.
 
-    - Reads request body as raw bytes first to allow Content-Type enforcement *before*
-      any JSON/Pydantic parsing (prevents FastAPI RequestValidationError from triggering
-      on non-JSON bodies).
-    - Enforces `Content-Type: application/json` and returns 415 for non-JSON payloads.
-      (Tests assert 415 on `text/plain`).
-    - Only after passing Content-Type check do we parse JSON and validate into
-      DraftSubmissionRequest.
-    - Performs semantic validation for mandatory metadata; on failure returns
-      422 with error_code `METADATA_VALIDATION_FAILED`.
-    - Appends an audit event for both success and failure.
+    Contract/testing requirements:
+    - Must enforce `Content-Type: application/json` (or `application/json; charset=...`)
+      and return 415 *before* attempting JSON/Pydantic parsing.
+    - Must read raw bytes via `await request.body()` for audit hashing only.
+      Raw bytes must never be included in any JSON response payloads.
+    - For JSON content-type: parse `await request.json()` and validate via
+      `DraftSubmissionRequest.model_validate(...)`.
+      If pydantic validation fails, return standardized 422 with error_code
+      `METADATA_VALIDATION_FAILED` and audit FAILURE.
+    - Happy path returns 201 and audits SUCCESS.
     """
     correlation_id = _correlation_id_from_request(request)
     actor_id = actor_id_from_authorization_header(authorization)
@@ -306,15 +306,16 @@ async def submit_draft(
 
     # Enforce content type explicitly *before* parsing.
     content_type = (request.headers.get("content-type") or "").lower()
-    if "application/json" not in content_type:
-        # For audit hashing, tests support bytes in payload hashing.
+    if not content_type.startswith("application/json"):
+        # Capture raw bytes only for audit hashing; do not echo bytes in any response.
+        raw_body = await request.body()
         audit_repo.append(
             event_type="DRAFT_SUBMITTED",
             actor_id=actor_id,
             correlation_id=correlation_id,
             outcome="FAILURE",
             reason="UNSUPPORTED_MEDIA_TYPE",
-            payload={"raw_body": body},
+            payload=raw_body,
             details={"path": str(request.url.path), "content_type": content_type},
         )
         return _standard_error(
@@ -326,9 +327,35 @@ async def submit_draft(
             details={"content_type": content_type},
         )
 
-    # Now safe to parse JSON. If malformed JSON, Starlette raises 400 which our HTTPException handler standardizes.
+    # Read raw bytes for audit hashing (only). This must happen before parsing in order
+    # to keep a stable representation for audit linkage.
+    raw_body = await request.body()
+
+    # Parse JSON. If malformed JSON, Starlette raises 400 -> handled by HTTPException handler.
     parsed_json = await request.json()
-    submission = DraftSubmissionRequest.model_validate(parsed_json)
+
+    # Validate payload into our model and standardize validation failures as 422 with
+    # METADATA_VALIDATION_FAILED (tests expect this status for missing/invalid metadata).
+    try:
+        submission = DraftSubmissionRequest.model_validate(parsed_json)
+    except ValidationError as ve:
+        audit_repo.append(
+            event_type="DRAFT_SUBMITTED",
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            outcome="FAILURE",
+            reason="METADATA_VALIDATION_FAILED",
+            payload=raw_body,
+            details={"validation_errors": _json_safe(ve.errors())},
+        )
+        return _standard_error(
+            error_code="METADATA_VALIDATION_FAILED",
+            message="Mandatory metadata is missing or invalid (schema_version, source, lineage, update_frequency).",
+            correlation_id=correlation_id,
+            http_status=422,
+            retryable=False,
+            details={"validation_errors": _json_safe(ve.errors())},
+        )
 
     missing = submission.missing_mandatory_metadata_fields()
     if missing:
@@ -338,7 +365,7 @@ async def submit_draft(
             correlation_id=correlation_id,
             outcome="FAILURE",
             reason="METADATA_VALIDATION_FAILED",
-            payload=submission.model_dump(),
+            payload=raw_body,
             details={"missing_fields": missing},
         )
         return JSONResponse(
@@ -361,6 +388,18 @@ async def submit_draft(
         correlation_id=correlation_id,
         submission=submission,
         idempotency_key=idempotency_key,
+    )
+
+    # Audit SUCCESS with the same raw-body linkage used for failures.
+    # (Service also audits success with structured payload; keeping this ensures raw bytes are
+    # available for hashing if needed without leaking them via API responses.)
+    audit_repo.append(
+        event_type="DRAFT_SUBMITTED",
+        actor_id=actor_id,
+        correlation_id=correlation_id,
+        outcome="SUCCESS",
+        payload=raw_body,
+        details={"draft_id": getattr(draft, "draft_id", None), "idempotency_key": idempotency_key},
     )
 
     return JSONResponse(
