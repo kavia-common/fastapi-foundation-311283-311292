@@ -91,9 +91,36 @@ class InMemoryAuditLogRepository:
         return [e for e in self._events if e.correlation_id == correlation_id]
 
 
+def _stable_json_default(obj: Any) -> Any:
+    """
+    JSON serializer fallback that is deterministic and bytes-safe.
+
+    - bytes/bytearray: decode UTF-8 with replacement (stable) for canonicalization
+      (note: for *hashing*, bytes are handled specially in sha256_canonical_json).
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    return str(obj)
+
+
 # PUBLIC_INTERFACE
-def sha256_canonical_json(payload: Dict[str, Any]) -> str:
-    """Compute SHA-256 of canonical JSON for stable hashing across runs."""
+def sha256_canonical_json(payload: Any) -> str:
+    """
+    Compute SHA-256 of canonical JSON for stable hashing across runs.
+
+    Robustness requirements (tests):
+    - Must not raise TypeError when payload (or nested values) contains bytes.
+    - If payload itself is bytes/bytearray, hash raw bytes directly.
+    """
+    if isinstance(payload, (bytes, bytearray)):
+        return hashlib.sha256(bytes(payload)).hexdigest()
+
     # Ensure determinism: sort keys, compact separators.
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=_stable_json_default,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

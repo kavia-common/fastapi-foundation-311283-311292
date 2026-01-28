@@ -19,6 +19,7 @@ Key behaviors:
 - Tests inject an in-memory audit repo via `app.state.audit_log_repo`.
 """
 
+import json
 import uuid
 from typing import Any, Dict, Optional
 
@@ -26,17 +27,18 @@ from fastapi import Body, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from src.api.models import (
     ApprovalDecision,
-    ApprovalDecisionRequest,
+    ApprovalDecisionBody,
     DraftSubmissionRequest,
     DraftSubmissionResponse,
     GateFailureError,
-    PublishRequest,
+    PublishBody,
     PublishResponse,
     StandardError,
-    ValidationRunRequest,
+    ValidationRunBody,
 )
 from src.api.repos import InMemoryDraftRepository
 from src.api.security import actor_id_from_authorization_header
@@ -94,6 +96,21 @@ def _standard_error(
         details=details,
     ).model_dump(exclude_none=True)
     return JSONResponse(status_code=http_status, content=payload)
+
+
+def _event_type_for_request(request: Request) -> str:
+    """Map request path to the event type expected by tests."""
+    path = request.url.path
+    if path == "/drafts" and request.method.upper() == "POST":
+        return "DRAFT_SUBMITTED"
+    if path.endswith("/validations") and request.method.upper() == "POST":
+        return "VALIDATION_RUN"
+    if path.endswith("/approvals") and request.method.upper() == "POST":
+        return "APPROVAL_DECISION"
+    if path.endswith("/publish") and request.method.upper() == "POST":
+        return "PUBLISH"
+    # fallback
+    return "UNKNOWN_EVENT"
 
 
 app = FastAPI(
@@ -165,34 +182,6 @@ async def _handle_request_validation_error(request: Request, exc: RequestValidat
     )
 
 
-@app.exception_handler(415)
-async def _handle_unsupported_media_type(_: Request, __: Exception) -> JSONResponse:
-    # Not used directly; FastAPI doesn't raise 415 by default for body parsing.
-    # We enforce Content-Type in the submit endpoint for deterministic behavior.
-    return _standard_error(
-        error_code="UNSUPPORTED_MEDIA_TYPE",
-        message="Unsupported Content-Type for dataset submission.",
-        correlation_id=str(uuid.uuid4()),
-        http_status=415,
-        retryable=False,
-    )
-
-
-def _event_type_for_request(request: Request) -> str:
-    """Map request path to the event type expected by tests."""
-    path = request.url.path
-    if path == "/drafts" and request.method.upper() == "POST":
-        return "DRAFT_SUBMITTED"
-    if path.endswith("/validations") and request.method.upper() == "POST":
-        return "VALIDATION_RUN"
-    if path.endswith("/approvals") and request.method.upper() == "POST":
-        return "APPROVAL_DECISION"
-    if path.endswith("/publish") and request.method.upper() == "POST":
-        return "PUBLISH"
-    # fallback
-    return "UNKNOWN_EVENT"
-
-
 # --- Routes ---
 
 
@@ -214,17 +203,18 @@ def health_check() -> Dict[str, str]:
         422: {"model": StandardError},
     },
 )
-def submit_draft(
+async def submit_draft(
     request: Request,
     response: Response,
-    payload: DraftSubmissionRequest = Body(...),
+    raw_body: bytes = Body(...),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> DraftSubmissionResponse:
+) -> JSONResponse:
     """
     Submit a new draft.
 
     - Enforces `Content-Type: application/json` (tests assert 415 on text/plain).
+      IMPORTANT: this is done before JSON parsing to avoid FastAPI returning 422/400 first.
     - Performs semantic validation for mandatory metadata; on failure returns
       422 with error_code `METADATA_VALIDATION_FAILED`.
     - Appends an audit event for both success and failure.
@@ -241,8 +231,9 @@ def submit_draft(
             correlation_id=correlation_id,
             outcome="FAILURE",
             reason="UNSUPPORTED_MEDIA_TYPE",
-            payload={"content_type": content_type},
-            details={"path": str(request.url.path)},
+            # bytes-safe hashing required by tests: we intentionally send bytes here
+            payload={"raw_body": raw_body},
+            details={"path": str(request.url.path), "content_type": content_type},
         )
         return _standard_error(
             error_code="UNSUPPORTED_MEDIA_TYPE",
@@ -253,8 +244,51 @@ def submit_draft(
             details={"content_type": content_type},
         )
 
-    # FastAPI will parse JSON into payload; we still need to validate mandatory metadata fields.
-    missing = payload.missing_mandatory_metadata_fields()
+    # Parse JSON ourselves so Content-Type check wins deterministically.
+    try:
+        decoded = raw_body.decode("utf-8", errors="replace")
+        json_obj = json.loads(decoded) if decoded.strip() else {}
+    except Exception:
+        audit_repo.append(
+            event_type="DRAFT_SUBMITTED",
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            outcome="FAILURE",
+            reason="BAD_REQUEST",
+            payload={"raw_body": raw_body},
+            details={"path": str(request.url.path), "content_type": content_type},
+        )
+        return _standard_error(
+            error_code="BAD_REQUEST",
+            message="Request body is not valid JSON or contains invalid fields.",
+            correlation_id=correlation_id,
+            http_status=400,
+            retryable=False,
+        )
+
+    try:
+        submission = DraftSubmissionRequest.model_validate(json_obj)
+    except ValidationError as ve:
+        # Shape errors should be 400 (tests rely on semantic metadata missing to be 422).
+        audit_repo.append(
+            event_type="DRAFT_SUBMITTED",
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            outcome="FAILURE",
+            reason="BAD_REQUEST",
+            payload={"validation_errors": ve.errors()},
+            details={"path": str(request.url.path)},
+        )
+        return _standard_error(
+            error_code="BAD_REQUEST",
+            message="Request body is not valid JSON or contains invalid fields.",
+            correlation_id=correlation_id,
+            http_status=400,
+            retryable=False,
+            details={"validation_errors": ve.errors()},
+        )
+
+    missing = submission.missing_mandatory_metadata_fields()
     if missing:
         audit_repo.append(
             event_type="DRAFT_SUBMITTED",
@@ -262,16 +296,14 @@ def submit_draft(
             correlation_id=correlation_id,
             outcome="FAILURE",
             reason="METADATA_VALIDATION_FAILED",
-            payload=payload.model_dump(),
+            payload=submission.model_dump(),
             details={"missing_fields": missing},
         )
         return JSONResponse(
             status_code=422,
             content=StandardError(
                 error_code="METADATA_VALIDATION_FAILED",
-                message=(
-                    "Mandatory metadata is missing or invalid (schema_version, source, lineage, update_frequency)."
-                ),
+                message="Mandatory metadata is missing or invalid (schema_version, source, lineage, update_frequency).",
                 correlation_id=correlation_id,
                 timestamp_utc=utc_now_iso_z(),
                 retryable=False,
@@ -285,11 +317,14 @@ def submit_draft(
     draft = service.submit_draft(
         actor_id=actor_id,
         correlation_id=correlation_id,
-        submission=payload,
+        submission=submission,
         idempotency_key=idempotency_key,
     )
 
-    return DraftSubmissionResponse(draft=draft, correlation_id=correlation_id)
+    return JSONResponse(
+        status_code=201,
+        content=DraftSubmissionResponse(draft=draft, correlation_id=correlation_id).model_dump(exclude_none=True),
+    )
 
 
 @app.post(
@@ -306,11 +341,9 @@ def submit_draft(
 def run_validation(
     draft_id: str,
     request: Request,
-    payload: ValidationRunRequest = Body(default=ValidationRunRequest(full_suite=True)),
+    body: ValidationRunBody = Body(default_factory=ValidationRunBody),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    # test-only deterministic input (not in OpenAPI; used by tests)
-    test_force_gate_failure: Optional[str] = Body(default=None, embed=False),
 ) -> JSONResponse:
     """
     Trigger validation run and return either success (200/202) or gate failure (422).
@@ -331,9 +364,9 @@ def run_validation(
             actor_id=actor_id,
             correlation_id=correlation_id,
             draft_id=draft_id,
-            req=payload,
+            req=body.payload,
             idempotency_key=idempotency_key,
-            test_force_gate_failure=test_force_gate_failure,
+            test_force_gate_failure=body.test_force_gate_failure,
         )
     except service.GateFailure as gf:
         err = GateFailureError(
@@ -360,11 +393,9 @@ def run_validation(
 def create_approval_decision(
     draft_id: str,
     request: Request,
-    payload: ApprovalDecisionRequest = Body(...),
+    body: ApprovalDecisionBody = Body(...),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    # test-only: allow test to provide submitter id for SoD simulation
-    test_submitter_id: Optional[str] = Body(default=None, embed=False),
 ) -> JSONResponse:
     """
     Record an approval decision.
@@ -384,9 +415,9 @@ def create_approval_decision(
             actor_id=actor_id,
             correlation_id=correlation_id,
             draft_id=draft_id,
-            req=payload,
+            req=body.payload,
             idempotency_key=idempotency_key,
-            test_submitter_id=test_submitter_id,
+            test_submitter_id=body.test_submitter_id,
         )
         return JSONResponse(status_code=201, content=decision.model_dump(exclude_none=True))
     except service.Forbidden as fe:
@@ -410,11 +441,9 @@ def create_approval_decision(
 def publish_draft(
     draft_id: str,
     request: Request,
-    payload: PublishRequest = Body(default=PublishRequest()),
+    body: PublishBody = Body(default_factory=PublishBody),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    # test-only deterministic injection (not in OpenAPI)
-    test_force_policy_decision: Optional[str] = Body(default=None, embed=False),
 ) -> JSONResponse:
     """
     Publish a draft.
@@ -434,14 +463,14 @@ def publish_draft(
             actor_id=actor_id,
             correlation_id=correlation_id,
             draft_id=draft_id,
-            req=payload,
+            req=body.payload,
             idempotency_key=idempotency_key,
-            test_force_policy_decision=test_force_policy_decision,
+            test_force_policy_decision=body.test_force_policy_decision,
         )
         # Tests expect correlation_id present in response (design intent).
-        body = pub.model_dump(exclude_none=True)
-        body["correlation_id"] = correlation_id
-        return JSONResponse(status_code=200, content=body)
+        resp_body = pub.model_dump(exclude_none=True)
+        resp_body["correlation_id"] = correlation_id
+        return JSONResponse(status_code=200, content=resp_body)
     except service.Forbidden as fe:
         return _standard_error(
             error_code=fe.error_code,

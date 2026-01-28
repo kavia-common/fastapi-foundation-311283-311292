@@ -34,10 +34,12 @@ class DataProductMetadata(BaseModel):
     description: str
     domain: str
     classification: str
-    schema_version: str
-    source: str
-    lineage: str
-    update_frequency: str
+    # NOTE: Tests expect missing keys to produce semantic 422, not Pydantic 422.
+    # Therefore we accept Optional and validate in service-layer.
+    schema_version: Optional[str] = None
+    source: Optional[str] = None
+    lineage: Optional[str] = None
+    update_frequency: Optional[str] = None
     critical_columns: Optional[List[str]] = None
     max_age_seconds: Optional[int] = None
 
@@ -51,10 +53,6 @@ class DraftSubmissionRequest(BaseModel):
     def missing_mandatory_metadata_fields(self) -> List[str]:
         """Return missing mandatory metadata fields per OpenAPI required list (tests rely on schema_version/lineage)."""
         missing: List[str] = []
-        # Required by spec: name, description, domain, classification, schema_version, source, lineage, update_frequency
-        # Pydantic will already require these, but tests simulate missing by removing keys;
-        # that becomes validation error unless fields are Optional. We keep required, but still check
-        # for safety for partial payloads or future loosening.
         md = self.metadata.model_dump()
         for k in ["schema_version", "source", "lineage", "update_frequency"]:
             v = md.get(k)
@@ -116,3 +114,42 @@ class PublishResponse(BaseModel):
     evidence_manifest_ref: str
     policy_decision: Optional[Dict[str, Any]] = None
     # correlation_id is injected in route response for tests (not in spec required fields)
+
+
+# ---- Wrapper body models (match generated OpenAPI Body_* schemas) ----
+
+
+class ValidationRunBody(BaseModel):
+    """
+    Wrapper body for POST /drafts/{draft_id}/validations.
+
+    Matches OpenAPI components/schemas/Body_runValidation:
+      { payload: ValidationRunRequest, test_force_gate_failure?: str }
+    """
+
+    payload: ValidationRunRequest = Field(default_factory=lambda: ValidationRunRequest(full_suite=True))
+    test_force_gate_failure: Optional[str] = None
+
+
+class ApprovalDecisionBody(BaseModel):
+    """
+    Wrapper body for POST /drafts/{draft_id}/approvals.
+
+    Matches OpenAPI components/schemas/Body_createApprovalDecision:
+      { payload: ApprovalDecisionRequest, test_submitter_id?: str }
+    """
+
+    payload: ApprovalDecisionRequest
+    test_submitter_id: Optional[str] = None
+
+
+class PublishBody(BaseModel):
+    """
+    Wrapper body for POST /drafts/{draft_id}/publish.
+
+    Matches OpenAPI components/schemas/Body_publishDraft:
+      { payload: PublishRequest, test_force_policy_decision?: str }
+    """
+
+    payload: PublishRequest = Field(default_factory=PublishRequest)
+    test_force_policy_decision: Optional[str] = None
